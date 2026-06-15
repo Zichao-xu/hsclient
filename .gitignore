@@ -1,0 +1,16 @@
+# Build output
+bin/
+obj/
+.vs/
+
+# Publish / packaging output
+publish/
+installer/
+
+# Bundled official binaries (NOT redistributed in source control — see README.md)
+bundle/*.exe
+bundle/*.dll
+*.bin
+
+# User-specific project files
+*.user

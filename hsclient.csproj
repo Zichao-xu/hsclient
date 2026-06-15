@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- M2.1: requireAdministrator manifest(启动即弹 UAC + EXE 盾牌角标) -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 安装/卸载项与窗口图标统一用自有品牌图标 -->
+    <ApplicationIcon>branding\app.ico</ApplicationIcon>
+
+    <!-- M3.1: self-contained 单文件发布(对外机器不保证装 .NET 8 Runtime);WinForms 必须关 trimming -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
+  <!-- 托盘状态图标:绿(在线)/灰(离线),作为嵌入资源随单文件 EXE 分发 -->
+  <ItemGroup>
+    <EmbeddedResource Include="branding\online.ico" />
+    <EmbeddedResource Include="branding\offline.ico" />
+  </ItemGroup>
+
+</Project>
