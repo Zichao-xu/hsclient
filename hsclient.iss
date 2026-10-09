@@ -11,7 +11,7 @@
 ; ============================================================================
 
 #define MyAppName "专网客户端"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "专网技术"
 #define MyAppExeName "hsclient.exe"
 #define TailscaledExe "tailscaled.exe"

@@ -1,29 +1,43 @@
 using System.Diagnostics;
 using System.Text;
-using System.Text.Json;
 
 namespace hsclient;
 
 public partial class Form1 : Form
 {
     private readonly CancellationTokenSource _pollCts = new();
-    private readonly ReconnectWatchdog _watchdog = new();
-
-    // 用户意图标志:连接成功置 true、主动 down 置 false。看门狗据此决定要不要拉起。
-    private volatile bool _userWantsOnline = false;
+    private readonly VpnSession _session;
+    private readonly IVpnEngine _engine;
+    private readonly IClientSettings _settings;
+    private readonly ReconnectWatchdog _watchdog;
+    private Task _pollTask = Task.CompletedTask;
+    private bool _operationBusy;
+    private bool _exitInProgress;
 
     // 唯一 UI 状态枚举:仅给托盘/状态灯着色用
     private enum LinkState { DaemonDown, Stopped, Starting, Online }
+    private LinkState _lastUiState = LinkState.DaemonDown;
 
     // 轮询一次的完整结果:UI 用 Ui,看门狗用 BackendRaw + DaemonReachable(一份解析,不重复写)
     private readonly record struct PollResult(LinkState Ui, string BackendRaw, bool DaemonReachable);
 
-    public Form1()
+    public Form1() : this(new TailscaleEngine(), new ClientSettings()) { }
+
+    internal Form1(IVpnEngine engine, IClientSettings settings)
     {
+        _engine = engine;
+        _settings = settings;
+        _session = new VpnSession(engine);
+        _watchdog = new ReconnectWatchdog(_session, () =>
+        {
+            string server = _settings.LoadServer();
+            return server == ServerStore.DefaultServer ? ("", "") : (server, _settings.LoadKey());
+        });
         InitializeComponent();
         InitTray();
         // 回填已配置的控制服务器地址(未配置则显示占位默认值,提示用户改成真实地址)
-        serverTextBox.Text = ServerStore.Load();
+        serverTextBox.Text = _settings.LoadServer();
+        keyTextBox.Text = _settings.LoadKey();
     }
 
     // ===================== M2.3:单实例唤起信号 =====================
@@ -63,7 +77,7 @@ public partial class Form1 : Form
             ShowInTaskbar = false;
         }
 
-        _ = PollLoopAsync(_pollCts.Token);   // fire-and-forget,但 token 可控
+        _pollTask = PollLoopAsync(_pollCts.Token);
     }
 
     protected override void OnResize(EventArgs e)
@@ -80,6 +94,12 @@ public partial class Form1 : Form
             e.Cancel = true; Hide(); ShowInTaskbar = false;   // 点 X → 缩托盘,不退出
             return;
         }
+        if (!_reallyExit && e.CloseReason == CloseReason.ApplicationExitCall)
+        {
+            e.Cancel = true;
+            _ = ExitAppAsync();
+            return;
+        }
         _pollCts.Cancel();        // 真退出时才停轮询(关机/注销/任务管理器结束也走这里)
         base.OnFormClosing(e);
     }
@@ -89,53 +109,44 @@ public partial class Form1 : Form
     private async Task PollLoopAsync(CancellationToken ct)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(4));
-        do
+        try
         {
-            try
+            do
             {
-                PollResult r = await RefreshOnceAsync(ct);   // 裸 await,保 UI 亲和性
-                ApplyState(r.Ui);                            // 在 UI 线程跑(await 续接)
-                _watchdog.OnPoll(r.BackendRaw, r.DaemonReachable, _userWantsOnline);
+                try
+                {
+                    PollResult r = await RefreshOnceAsync(ct);
+                    ct.ThrowIfCancellationRequested();
+                    if (!_operationBusy) ApplyState(r.Ui);
+                    _watchdog.OnPoll(r.BackendRaw, r.DaemonReachable);
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception) { if (!ct.IsCancellationRequested) ApplyState(LinkState.DaemonDown); }
             }
-            catch (OperationCanceledException) { break; }    // 取消=正常退出
-            catch (Exception)
-            {
-                ApplyState(LinkState.DaemonDown);            // 单次失败只置离线,绝不杀循环
-            }
+            while (await timer.WaitForNextTickAsync(ct));
         }
-        while (await timer.WaitForNextTickAsync(ct));
+        catch (OperationCanceledException) { }
     }
 
     private async Task<PollResult> RefreshOnceAsync(CancellationToken ct)
     {
-        var (exit, stdout, _) = await RunTailscaleAsync("status --json", TimeSpan.FromSeconds(8), ct);
-        // backend 没起时 BackendState="NoState" 但 exit 仍可能为 0 → 判定看字符串,不看退出码
-        if (exit != 0 || string.IsNullOrWhiteSpace(stdout))
+        string? backend = await _engine.ReadBackendStateAsync(ct);
+        if (backend == null)
             return new PollResult(LinkState.DaemonDown, "DaemonDown", false);
-        try
+        LinkState ui = backend switch
         {
-            using var doc = JsonDocument.Parse(stdout);
-            var root = doc.RootElement;
-            string backend = root.TryGetProperty("BackendState", out var b) ? (b.GetString() ?? "") : "";
-
-            // ★ 在线判定只看 BackendState=="Running",不用 Self.Online 降级(B1)
-            LinkState ui = backend switch
-            {
-                "Running"  => LinkState.Online,
-                "Starting" => LinkState.Starting,
-                "Stopped"  => LinkState.Stopped,
-                _          => LinkState.DaemonDown,   // NoState/NeedsLogin/NeedsMachineAuth...
-            };
-            return new PollResult(ui, backend, true); // daemon 可达(status 解析成功)
-        }
-        catch (JsonException)
-        {
-            return new PollResult(LinkState.DaemonDown, "DaemonDown", false); // 解析失败兜底,不冒泡
-        }
+            "Running" => LinkState.Online,
+            "Starting" => LinkState.Starting,
+            "Stopped" => LinkState.Stopped,
+            _ => LinkState.DaemonDown,
+        };
+        return new PollResult(ui, backend, true);
     }
 
     private void ApplyState(LinkState state)   // 只在 UI 线程被调用
     {
+        _lastUiState = state;
+        connectButton.Text = state == LinkState.Online ? "断开" : "连接";
         switch (state)
         {
             case LinkState.Online:
@@ -163,7 +174,7 @@ public partial class Form1 : Form
         _miShow       = new ToolStripMenuItem("显示主窗口", null, (s, e) => ShowMainWindow());
         _miConnect    = new ToolStripMenuItem("连接",       null, async (s, e) => await DoConnect());
         _miDisconnect = new ToolStripMenuItem("断开",       null, async (s, e) => await DoDisconnect());
-        _miExit       = new ToolStripMenuItem("退出",       null, (s, e) => ExitApp());
+        _miExit       = new ToolStripMenuItem("退出并断开", null, async (s, e) => await ExitAppAsync());
         _trayMenu.Items.AddRange(new ToolStripItem[]
         {
             _miShow, new ToolStripSeparator(), _miConnect, _miDisconnect,
@@ -173,7 +184,7 @@ public partial class Form1 : Form
         _notifyIcon = new NotifyIcon
         {
             Icon = AppIcons.Offline,          // 启动默认离线灰
-            Text = "hsclient — 未连接",        // ≤63 字符(NOTIFYICONDATA szTip 限制)
+            Text = "专网客户端 — 未连接",
             Visible = true,
             ContextMenuStrip = _trayMenu
         };
@@ -191,11 +202,45 @@ public partial class Form1 : Form
         Activate(); BringToFront();   // 抢焦点,缺一不可
     }
 
-    private void ExitApp()
+    private async Task ExitAppAsync()
     {
-        _reallyExit = true;
-        if (_notifyIcon != null) _notifyIcon.Visible = false;  // 先灭图标
-        Application.Exit();
+        if (_exitInProgress || _reallyExit) return;
+        _exitInProgress = true;
+        _pollCts.Cancel();
+        SetStatusText("正在断开并退出…");
+        SetOperationControls();
+        try
+        {
+            await _session.ExitAsync();
+            await _pollTask;
+            _reallyExit = true;
+            if (_notifyIcon != null) _notifyIcon.Visible = false;
+            Application.Exit();
+        }
+        catch (Exception)
+        {
+            // Keep the application visible: never claim it is disconnected on a failed stop.
+            ShowMainWindow();
+            SetStatusText("退出失败，连接可能仍在运行");
+            MessageBox.Show("未能停止专网服务，连接可能仍在运行。请重试“退出并断开”，或联系管理员。",
+                "退出未完成", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _exitInProgress = false;
+            if (!IsDisposed) SetOperationControls();
+        }
+    }
+
+    private void SetOperationControls()
+    {
+        bool canOperate = !_operationBusy && !_exitInProgress && !_session.IsExiting;
+        connectButton.Enabled = canOperate;
+        serverTextBox.Enabled = canOperate;
+        keyTextBox.Enabled = canOperate;
+        if (_miConnect != null) _miConnect.Enabled = canOperate && _lastUiState != LinkState.Online;
+        if (_miDisconnect != null) _miDisconnect.Enabled = canOperate && _lastUiState == LinkState.Online;
+        if (_miExit != null) _miExit.Enabled = !_exitInProgress;
     }
 
     // 由 ApplyState 调用
@@ -203,21 +248,24 @@ public partial class Form1 : Form
     {
         if (_notifyIcon == null) return;
         _notifyIcon.Icon = online ? AppIcons.Online : AppIcons.Offline;
-        _notifyIcon.Text = online ? "hsclient — 已连接" : "hsclient — 未连接"; // ≤63 字符
-        if (_miConnect != null)    _miConnect.Enabled    = !online;
-        if (_miDisconnect != null) _miDisconnect.Enabled = online;
+        _notifyIcon.Text = online ? "专网客户端 — 已连接" : "专网客户端 — 未连接";
+        bool canOperate = !_operationBusy && !_exitInProgress && !_session.IsExiting;
+        if (_miConnect != null)    _miConnect.Enabled    = canOperate && !online;
+        if (_miDisconnect != null) _miDisconnect.Enabled = canOperate && online;
     }
 
     // ===================== 连接 / 断开(M1 逻辑 + M2 接线) =====================
 
     private async void connectButton_Click(object sender, EventArgs e)
     {
-        await DoConnect();
+        if (_lastUiState == LinkState.Online) await DoDisconnect();
+        else await DoConnect();
     }
 
     /// <summary>托盘"连接"与主窗"连接"按钮共用。无 key 时弹出主窗让用户填。</summary>
     private async Task DoConnect()
     {
+        if (_operationBusy || _session.IsExiting) return;
         string server = serverTextBox.Text.Trim();
         if (string.IsNullOrEmpty(server) || server == ServerStore.DefaultServer)
         {
@@ -236,27 +284,23 @@ public partial class Form1 : Form
             return;
         }
 
-        connectButton.Enabled = false;
+        _operationBusy = true;
+        SetOperationControls();
         SetStatusText("连接中…");
         try
         {
             // ★ 首次手动连接必须带 --unattended(否则注销/重启掉登录)
-            var (exitCode, _, stderr) = await RunTailscaleAsync(
-                $"up --login-server={server} --authkey={authKey} --accept-routes --unattended --timeout=30s",
-                TimeSpan.FromSeconds(40));
-
-            if (exitCode != 0)
-            {
-                MessageBox.Show(FriendlyError(stderr), "连接失败",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
+            await _session.ConnectAsync(server, authKey);
 
             // 连接成功:记录用户意图 + 存 server/key 供看门狗复用
-            _userWantsOnline = true;
-            ServerStore.Save(server);
-            AuthKeyStore.Save(authKey);
+            _settings.Save(server, authKey);
         }
+        catch (TailscaleCommandException ex)
+        {
+            if (!_session.IsExiting)
+                MessageBox.Show(FriendlyError(ex.ErrorOutput), "连接失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        catch (OperationCanceledException) when (_session.IsExiting) { }
         catch (OperationCanceledException)
         {
             // 连接超时 / 隧道太慢 / 本机缺少网络组件(如 wintun.dll 缺失导致虚拟网卡建不起来)。
@@ -270,14 +314,16 @@ public partial class Form1 : Form
                 "连接超时",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            MessageBox.Show($"无法调用 tailscale:{ex.Message}", "连接失败",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!_session.IsExiting)
+                MessageBox.Show("无法启动专网连接，请确认客户端已正确安装，或联系管理员。", "连接失败",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
         {
-            connectButton.Enabled = true;
+            _operationBusy = false;
+            if (!IsDisposed) SetOperationControls();
         }
         // 状态交给下一轮轮询刷新(4s 内),这里不重复解析
     }
@@ -285,16 +331,22 @@ public partial class Form1 : Form
     /// <summary>托盘"断开":tailscale down,并清用户意图(看门狗据此不再自动拉起)。</summary>
     private async Task DoDisconnect()
     {
-        _userWantsOnline = false;   // 尊重用户主动断开
+        if (_operationBusy || _session.IsExiting) return;
+        _operationBusy = true;
+        SetOperationControls();
+        SetStatusText("正在断开…");
         try
         {
-            await RunTailscaleAsync("down", TimeSpan.FromSeconds(20));
+            await _session.DisconnectAsync();
+            if (!_session.IsExiting) ApplyState(LinkState.Stopped);
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            MessageBox.Show($"断开失败:{ex.Message}", "提示",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            if (!_session.IsExiting)
+                MessageBox.Show("未能确认专网已断开。请重试，或选择“退出并断开”。", "断开未完成",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
+        finally { _operationBusy = false; if (!IsDisposed) SetOperationControls(); }
     }
 
     private void SetStatusText(string text) => statusLabel.Text = text;
@@ -316,12 +368,11 @@ public partial class Form1 : Form
 
     // ★ internal(非 private):ReconnectWatchdog 跨类调用(B2)
     internal static async Task<(int ExitCode, string StdOut, string StdErr)>
-        RunTailscaleAsync(string arguments, TimeSpan timeout, CancellationToken ct = default)
+        RunTailscaleAsync(IEnumerable<string> arguments, TimeSpan timeout, CancellationToken ct = default)
     {
         var psi = new ProcessStartInfo
         {
             FileName  = ResolveTailscalePath(),
-            Arguments = arguments,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
@@ -329,6 +380,7 @@ public partial class Form1 : Form
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding  = Encoding.UTF8,
         };
+        foreach (string argument in arguments) psi.ArgumentList.Add(argument);
         using var proc = new Process { StartInfo = psi };
         proc.Start();
         Task<string> outTask = proc.StandardOutput.ReadToEndAsync();  // 两流并读防管道死锁

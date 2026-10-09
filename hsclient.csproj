@@ -18,10 +18,13 @@
     <PublishSingleFile>true</PublishSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <Version>1.0.1</Version>
   </PropertyGroup>
 
   <!-- 托盘状态图标:绿(在线)/灰(离线),作为嵌入资源随单文件 EXE 分发 -->
   <ItemGroup>
+    <Compile Remove="tests\**\*.cs" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.0" />
     <EmbeddedResource Include="branding\online.ico" />
     <EmbeddedResource Include="branding\offline.ico" />
   </ItemGroup>

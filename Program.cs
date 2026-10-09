@@ -61,7 +61,7 @@ static class Program
         try { Process.Start(psi); return true; }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223) // ERROR_CANCELLED,用户点了"否"
         {
-            MessageBox.Show("hsclient 需要管理员权限才能连接。", "需要权限",
+            MessageBox.Show("专网客户端需要管理员权限才能连接。", "需要权限",
                             MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
